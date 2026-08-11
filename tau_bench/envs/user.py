@@ -2,9 +2,32 @@
 
 import abc
 import enum
+import re
 from litellm import completion
 
 from typing import Optional, List, Dict, Any, Union
+
+
+def _strip_think_block(content: str) -> str:
+    """Removes a leading <think>...</think> reasoning block (Qwen3 and
+    similar reasoning models expose this) from a user-simulator completion.
+
+    BUG FIX (2026-07-29): LLMUserSimulationEnv.generate_next_message()
+    previously returned message.content completely raw. Two real, confirmed
+    problems this caused: (1) the agent received the user-simulator's
+    internal reasoning as if it were the user's spoken message, in every
+    episode; (2) base.py's termination check ("###STOP###" in observation)
+    is a naive substring match with no concept of "mentioned in reasoning"
+    vs. "actually said" -- a model discussing the STOP convention
+    hypothetically inside its own <think> block (e.g. "...then I can say
+    ###STOP###. Wait, the agent's message is asking...") falsely triggered
+    episode termination. Confirmed on 3 of 10 pilot episodes (task_003,
+    task_004, task_008) with the vLLM-hosted Qwen3-32B user-simulator --
+    each ended after a single turn with no real stop intent, because
+    "###STOP###" merely appeared somewhere in the reasoning. Stripping the
+    think block before it becomes the observation fixes both issues at
+    once."""
+    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
 
 class BaseUserSimulationEnv(abc.ABC):
@@ -44,13 +67,28 @@ class LLMUserSimulationEnv(BaseUserSimulationEnv):
         self.reset()
 
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
+        # timeout=1200 (2x litellm's 600s default): confirmed via vLLM server
+        # log during the CLEAN gate run that task_016/task_024's "timeouts"
+        # were NOT stalls -- the engine was generating continuously the whole
+        # 600s (KV cache usage climbing, "Running: 1 reqs" throughout).
+        # Qwen3-32B's thinking mode occasionally emits a long CoT trace before
+        # its actual response; the fix is more wall-clock room, not retry
+        # logic or connection-pool tuning.
         res = completion(
-            model=self.model, custom_llm_provider=self.provider, messages=messages
+            model=self.model,
+            custom_llm_provider=self.provider,
+            messages=messages,
+            timeout=1200,
         )
         message = res.choices[0].message
+        # Full raw message (including any <think> block) kept in the
+        # user-simulator's own conversation history, so it retains its own
+        # reasoning continuity across turns -- only the RETURNED value
+        # (what the agent sees and what termination is checked against) is
+        # stripped. See _strip_think_block()'s docstring for why.
         self.messages.append(message.model_dump())
         self.total_cost = res._hidden_params["response_cost"]
-        return message.content
+        return _strip_think_block(message.content)
 
     def build_system_prompt(self, instruction: Optional[str]) -> str:
         instruction_display = (
@@ -115,8 +153,18 @@ User Response:
 <the user response (this will be parsed and sent to the agent)>"""
 
     def generate_next_message(self, messages: List[Dict[str, Any]]) -> str:
+        # timeout=1200 (2x litellm's 600s default): confirmed via vLLM server
+        # log during the CLEAN gate run that task_016/task_024's "timeouts"
+        # were NOT stalls -- the engine was generating continuously the whole
+        # 600s (KV cache usage climbing, "Running: 1 reqs" throughout).
+        # Qwen3-32B's thinking mode occasionally emits a long CoT trace before
+        # its actual response; the fix is more wall-clock room, not retry
+        # logic or connection-pool tuning.
         res = completion(
-            model=self.model, custom_llm_provider=self.provider, messages=messages
+            model=self.model,
+            custom_llm_provider=self.provider,
+            messages=messages,
+            timeout=1200,
         )
         message = res.choices[0].message
         self.messages.append(message.model_dump())
